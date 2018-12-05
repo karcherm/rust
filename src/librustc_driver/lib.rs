@@ -26,6 +26,7 @@
 #![feature(slice_sort_by_cached_key)]
 #![feature(set_stdio)]
 #![feature(no_debug)]
+#![feature(integer_atomics)]
 
 #![recursion_limit="256"]
 
@@ -77,7 +78,7 @@ use pretty::{PpMode, UserIdentifiedItem};
 use rustc_resolve as resolve;
 use rustc_save_analysis as save;
 use rustc_save_analysis::DumpHandler;
-use rustc_data_structures::sync::{self, Lrc};
+use rustc_data_structures::sync::{self, Lrc, Ordering::SeqCst};
 use rustc_data_structures::OnDrop;
 use rustc::session::{self, config, Session, build_session, CompileResult};
 use rustc::session::CompileIncomplete;
@@ -952,7 +953,7 @@ impl<'a> CompilerCalls<'a> for RustcDefaultCalls {
                 let sess = state.session;
                 eprintln!("Fuel used by {}: {}",
                     sess.print_fuel_crate.as_ref().unwrap(),
-                    sess.print_fuel.get());
+                    sess.print_fuel.load(SeqCst));
             }
         }
         control
