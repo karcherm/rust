@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use errors::DiagnosticBuilder;
+use errors::{Diagnostic, DiagnosticBuilder};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
@@ -19,6 +19,7 @@ use std::hash::Hash;
 use std::collections::hash_map::Entry;
 use ty::{self, TyCtxt};
 use util::common::{ProfileQueriesMsg, profq_msg};
+use parking_lot::{Mutex, Condvar};
 
 use ich::{StableHashingContext, StableHashingContextProvider, Fingerprint};
 
@@ -70,6 +71,12 @@ struct DepGraphData {
 
     colors: DepNodeColorMap,
 
+    /// A set of loaded diagnostics which has been emitted.
+    emitted_diagnostics: Mutex<FxHashSet<DepNodeIndex>>,
+
+    /// Used to wait for diagnostics to be emitted.
+    emitted_diagnostics_cond_var: Condvar,
+
     /// When we load, there may be `.o` files, cached mir, or other such
     /// things available to us. If we find that they are not dirty, we
     /// load the path to the file storing those work-products here into
@@ -93,6 +100,8 @@ impl DepGraph {
                 previous_work_products: prev_work_products,
                 dep_node_debug: Default::default(),
                 current: Lock::new(CurrentDepGraph::new(prev_graph_node_count)),
+                emitted_diagnostics: Default::default(),
+                emitted_diagnostics_cond_var: Condvar::new(),
                 previous: prev_graph,
                 colors: DepNodeColorMap::new(prev_graph_node_count),
                 loaded_from_cache: Default::default(),
@@ -711,28 +720,18 @@ impl DepGraph {
         };
 
         // ... emitting any stored diagnostic ...
-        if did_allocation {
-            // Only the thread which did the allocation emits the error messages
 
-            // FIXME: Ensure that these are printed before returning for all threads.
-            // Currently threads where did_allocation = false can continue on
-            // and emit other diagnostics before these diagnostics are emitted.
-            // Such diagnostics should be emitted after these.
-            // See https://github.com/rust-lang/rust/issues/48685
-            let diagnostics = tcx.queries.on_disk_cache
-                                 .load_diagnostics(tcx, prev_dep_node_index);
+        let diagnostics = tcx.queries.on_disk_cache
+                                .load_diagnostics(tcx, prev_dep_node_index);
 
-            if diagnostics.len() > 0 {
-                let handle = tcx.sess.diagnostic();
-
-                // Promote the previous diagnostics to the current session.
-                tcx.queries.on_disk_cache
-                   .store_diagnostics(dep_node_index, diagnostics.clone());
-
-                for diagnostic in diagnostics {
-                    DiagnosticBuilder::new_diagnostic(handle, diagnostic).emit();
-                }
-            }
+        if unlikely!(diagnostics.len() > 0) {
+            self.emit_diagnostics(
+                tcx,
+                data,
+                dep_node_index,
+                did_allocation,
+                diagnostics
+            );
         }
 
         // ... and finally storing a "Green" entry in the color map.
@@ -746,6 +745,49 @@ impl DepGraph {
 
         debug!("try_mark_previous_green({:?}) - END - successfully marked as green", dep_node);
         Some(dep_node_index)
+    }
+
+    /// Atomically emits some loaded diagnotics assuming that this only gets called with
+    /// did_allocation set to true on one thread
+    #[cold]
+    #[inline(never)]
+    fn emit_diagnostics<'tcx>(
+        &self,
+        tcx: TyCtxt<'_, 'tcx, 'tcx>,
+        data: &DepGraphData,
+        dep_node_index: DepNodeIndex,
+        did_allocation: bool,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        if did_allocation || !cfg!(parallel_queries) {
+            // Only the thread which did the allocation emits the error messages
+            let handle = tcx.sess.diagnostic();
+
+            // Promote the previous diagnostics to the current session.
+            tcx.queries.on_disk_cache
+                .store_diagnostics(dep_node_index, diagnostics.clone());
+
+            for diagnostic in diagnostics {
+                DiagnosticBuilder::new_diagnostic(handle, diagnostic).emit();
+            }
+
+            #[cfg(parallel_queries)]
+            {
+                // Mark the diagnostics and emitted and wake up waiters
+                data.emitted_diagnostics.lock().insert(dep_node_index);
+                data.emitted_diagnostics_cond_var.notify_all();
+            }
+        } else {
+            // The other threads will wait for the diagnostics to be emitted
+
+            let mut emitted_diagnostics = data.emitted_diagnostics.lock();
+            loop {
+                if emitted_diagnostics.contains(&dep_node_index) {
+                    break;
+                }
+                data.emitted_diagnostics_cond_var.wait(&mut emitted_diagnostics);
+            }
+        }
     }
 
     // Returns true if the given node has been marked as green during the
