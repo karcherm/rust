@@ -80,6 +80,7 @@ cfg_if! {
         pub struct Atomic<T: Copy>(Cell<T>);
 
         impl<T: Copy> Atomic<T> {
+            #[inline]
             pub fn new(v: T) -> Self {
                 Atomic(Cell::new(v))
             }
@@ -90,10 +91,12 @@ cfg_if! {
                 self.0.into_inner()
             }
 
+            #[inline]
             pub fn load(&self, _: Ordering) -> T {
                 self.0.get()
             }
 
+            #[inline]
             pub fn store(&self, val: T, _: Ordering) {
                 self.0.set(val)
             }
@@ -128,6 +131,7 @@ cfg_if! {
 
         pub type AtomicUsize = Atomic<usize>;
         pub type AtomicBool = Atomic<bool>;
+        pub type AtomicU32 = Atomic<u32>;
         pub type AtomicU64 = Atomic<u64>;
 
         pub use self::serial_join as join;
@@ -233,7 +237,7 @@ cfg_if! {
         pub use parking_lot::MutexGuard as LockGuard;
         pub use parking_lot::MappedMutexGuard as MappedLockGuard;
 
-        pub use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU64};
+        pub use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU32, AtomicU64};
 
         pub use std::sync::Arc as Lrc;
         pub use std::sync::Weak as Weak;
