@@ -1584,7 +1584,6 @@ pub struct Resolver<'a> {
     macro_map: FxHashMap<DefId, Lrc<SyntaxExtension>>,
     macro_defs: FxHashMap<Mark, DefId>,
     local_macro_def_scopes: FxHashMap<NodeId, Module<'a>>,
-    pub found_unresolved_macro: bool,
 
     /// List of crate local macros that we need to warn about as being unused.
     /// Right now this only includes macro_rules! macros, and macros 2.0.
@@ -1919,7 +1918,6 @@ impl<'a> Resolver<'a> {
             name_already_seen: FxHashMap::default(),
             potentially_unused_imports: Vec::new(),
             struct_constructors: Default::default(),
-            found_unresolved_macro: false,
             unused_macros: FxHashSet::default(),
             current_type_ascription: Vec::new(),
             injected_crate: None,
@@ -2032,8 +2030,10 @@ impl<'a> Resolver<'a> {
                                       record_used_id: Option<NodeId>,
                                       path_span: Span)
                                       -> Option<LexicalScopeBinding<'a>> {
-        let record_used = record_used_id.is_some();
         assert!(ns == TypeNS  || ns == ValueNS);
+        if ident.name == keywords::Invalid.name() {
+            return Some(LexicalScopeBinding::Def(Def::Err));
+        }
         if ns == TypeNS {
             ident.span = if ident.name == keywords::SelfUpper.name() {
                 // FIXME(jseyfried) improve `Self` hygiene
@@ -2046,6 +2046,7 @@ impl<'a> Resolver<'a> {
         }
 
         // Walk backwards up the ribs in scope.
+        let record_used = record_used_id.is_some();
         let mut module = self.graph_root;
         for i in (0 .. self.ribs[ns].len()).rev() {
             if let Some(def) = self.ribs[ns][i].bindings.get(&ident).cloned() {
@@ -3213,23 +3214,43 @@ impl<'a> Resolver<'a> {
                 let enum_candidates =
                     this.lookup_import_candidates(ident, ns, is_enum_variant);
                 let mut enum_candidates = enum_candidates.iter()
-                    .map(|suggestion| import_candidate_to_paths(&suggestion)).collect::<Vec<_>>();
+                    .map(|suggestion| {
+                        import_candidate_to_enum_paths(&suggestion)
+                    }).collect::<Vec<_>>();
                 enum_candidates.sort();
-                for (sp, variant_path, enum_path) in enum_candidates {
-                    if sp.is_dummy() {
-                        let msg = format!("there is an enum variant `{}`, \
-                                           try using `{}`?",
-                                          variant_path,
-                                          enum_path);
-                        err.help(&msg);
+
+                if !enum_candidates.is_empty() {
+                    // contextualize for E0412 "cannot find type", but don't belabor the point
+                    // (that it's a variant) for E0573 "expected type, found variant"
+                    let preamble = if def.is_none() {
+                        let others = match enum_candidates.len() {
+                            1 => String::new(),
+                            2 => " and 1 other".to_owned(),
+                            n => format!(" and {} others", n)
+                        };
+                        format!("there is an enum variant `{}`{}; ",
+                                enum_candidates[0].0, others)
                     } else {
-                        err.span_suggestion_with_applicability(
-                            span,
-                            "you can try using the variant's enum",
-                            enum_path,
-                            Applicability::MachineApplicable,
-                        );
-                    }
+                        String::new()
+                    };
+                    let msg = format!("{}try using the variant's enum", preamble);
+
+                    err.span_suggestions_with_applicability(
+                        span,
+                        &msg,
+                        enum_candidates.into_iter()
+                            .map(|(_variant_path, enum_ty_path)| enum_ty_path)
+                            // variants reëxported in prelude doesn't mean `prelude::v1` is the
+                            // type name! FIXME: is there a more principled way to do this that
+                            // would work for other reëxports?
+                            .filter(|enum_ty_path| enum_ty_path != "std::prelude::v1")
+                            // also say `Option` rather than `std::prelude::v1::Option`
+                            .map(|enum_ty_path| {
+                                // FIXME #56861: DRYer prelude filtering
+                                enum_ty_path.trim_start_matches("std::prelude::v1::").to_owned()
+                            }),
+                        Applicability::MachineApplicable,
+                    );
                 }
             }
             if path.len() == 1 && this.self_type_is_available(span) {
@@ -5128,8 +5149,8 @@ fn path_names_to_string(path: &Path) -> String {
                         .collect::<Vec<_>>())
 }
 
-/// Get the path for an enum and the variant from an `ImportSuggestion` for an enum variant.
-fn import_candidate_to_paths(suggestion: &ImportSuggestion) -> (Span, String, String) {
+/// Get the stringified path for an enum from an `ImportSuggestion` for an enum variant.
+fn import_candidate_to_enum_paths(suggestion: &ImportSuggestion) -> (String, String) {
     let variant_path = &suggestion.path;
     let variant_path_string = path_names_to_string(variant_path);
 
@@ -5140,7 +5161,7 @@ fn import_candidate_to_paths(suggestion: &ImportSuggestion) -> (Span, String, St
     };
     let enum_path_string = path_names_to_string(&enum_path);
 
-    (suggestion.path.span, variant_path_string, enum_path_string)
+    (variant_path_string, enum_path_string)
 }
 
 
